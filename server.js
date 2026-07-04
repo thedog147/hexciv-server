@@ -56,6 +56,26 @@ wss.on('connection', function (ws) {
 
     const { type, roomID, payload } = packet;
 
+    // ── 查詢類封包（不需要加入房間）────────────────────
+    if(type === 'GET_ROOMS' || type === 'CREATE_ROOM'){
+      if(type === 'GET_ROOMS'){
+        const roomList = [];
+        for(const [rid, r] of rooms){
+          roomList.push({
+            roomID:      rid,
+            playerCount: r.players.size,
+            maxPlayers:  MAX_ROOM,
+            started:     r.gameStarted || false,
+          });
+        }
+        ws.send(JSON.stringify({ type: 'ROOMS_LIST', payload: { rooms: roomList } }));
+      } else {
+        const newRoomID = 'room' + String(Date.now()).slice(-6);
+        ws.send(JSON.stringify({ type: 'ROOM_CREATED', payload: { roomID: newRoomID } }));
+      }
+      return;
+    }
+
     // ── JOIN：加入房間 ────────────────────────────────
     if (type === 'JOIN') {
       if (!roomID) { ws.send(JSON.stringify({ type: 'ERROR', payload: { msg: '缺少 roomID' } })); return; }
@@ -163,6 +183,7 @@ wss.on('connection', function (ws) {
         if(packet.payload?.seed){
           currentRoom.mapConfig = { seed: packet.payload.seed, mapType: packet.payload.mapType };
         }
+        currentRoom.gameStarted = true;
         console.log(`[Start] 房主啟動遊戲，房間 ${roomID}，種子=${currentRoom.mapConfig?.seed}`);
         broadcastAll(currentRoom, {
           type: 'GAME_START',
