@@ -356,6 +356,12 @@ wss.on('connection', function (ws) {
         broadcast(currentRoom, packet, ws);
         break;
 
+      case 'LOGISTICS_SNAPSHOT':
+        // 賽後分析用後勤真相快照：只寫進回放紀錄，「絕對不」broadcast 給任何人，
+        // 確保正式對戰當下敵方依然看不到彼此的彈藥/油料/人力（安全機制不變）
+        logReplayEvent(currentRoom, 'LOGISTICS_SNAPSHOT', packet.payload, currentPlayer.playerID);
+        break;
+
       case 'END_TURN':
         if(!currentRoom.endedPlayers) currentRoom.endedPlayers = new Set();
         currentRoom.endedPlayers.add(currentPlayer.playerID);
@@ -424,4 +430,4 @@ wss.on('connection', function (ws) {
 function getRoomID(targetRoom) {
   for (const [id, r] of rooms) { if (r === targetRoom) return id; }
   return null;
-}
+                }
