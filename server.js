@@ -12,6 +12,10 @@ const { WebSocketServer } = require('ws');
 const PORT     = 8080;
 const MAX_ROOM = 30;   // 每房間最多玩家數
 
+// ⏱️ 每回合行動時間限制（秒）── IGO-UGO 制下，輪到的陣營全員行動的思考時間上限。
+//    時間到會強制結束該陣營回合、換對方行動。要調整回合秒數，直接改這個數字即可。
+const TURN_TIME_LIMIT_SECONDS = 120;
+
 // rooms Map：roomID → { players: Map<ws, playerInfo> }
 const rooms = new Map();
 
@@ -106,6 +110,66 @@ function broadcastAll(room, packet) {
 }
 
 // ══════════════════════════════════════════════════════
+// § IGO-UGO 回合制：紅軍先動、藍軍後動，雙方輪流交替
+// ══════════════════════════════════════════════════════
+
+// ── 清除該房間目前掛著的回合限時計時器 ──────────────
+function clearTurnTimer(room){
+  if(room.turnTimerHandle){
+    clearTimeout(room.turnTimerHandle);
+    room.turnTimerHandle = null;
+  }
+}
+
+// ── 啟動新一段陣營回合的限時倒數（時間到 → 強制推進）──
+function startTurnTimer(room, roomID){
+  clearTurnTimer(room);
+  room.turnDeadline = Date.now() + TURN_TIME_LIMIT_SECONDS * 1000;
+  room.turnTimerHandle = setTimeout(() => {
+    console.log(`[Turn] 房間 ${roomID}：${room.activeTeam} 陣營 ${TURN_TIME_LIMIT_SECONDS} 秒時間到，強制結束回合`);
+    advanceToNextTeam(room, roomID, true);
+  }, TURN_TIME_LIMIT_SECONDS * 1000);
+}
+
+// ── 換下一個陣營行動；藍軍動完才代表一整回合結束，turnCount 才 +1 ──
+function advanceToNextTeam(room, roomID, forced){
+  clearTurnTimer(room);
+  room.endedPlayers = new Set();
+
+  const finishedTeam = room.activeTeam || 'RED';
+  room.activeTeam = (finishedTeam === 'RED') ? 'BLUE' : 'RED';
+  if(finishedTeam === 'BLUE'){
+    room.turnCount = (room.turnCount || 1) + 1;
+  }
+
+  console.log(`[Turn] 房間 ${roomID}：${finishedTeam} → ${room.activeTeam} 行動${forced ? '（強制推進）' : ''}，目前第 ${room.turnCount || 1} 回合`);
+  logReplayEvent(room, 'TURN_ADVANCE', {
+    turnCount:  room.turnCount || 1,
+    activeTeam: room.activeTeam,
+    forced:     !!forced,
+  }, null);
+
+  startTurnTimer(room, roomID);
+
+  broadcastAll(room, {
+    type: 'TURN_ADVANCE',
+    roomID,
+    payload: {
+      turnCount:    room.turnCount || 1,
+      activeTeam:   room.activeTeam,
+      forced:       !!forced,
+      deadline:     room.turnDeadline,
+      limitSeconds: TURN_TIME_LIMIT_SECONDS,
+    }
+  });
+}
+
+// ── 判斷某玩家目前是否輪到他的陣營行動（room.activeTeam 未設定時視為不限制，相容單機/舊房間）──
+function isActiveTeamPlayer(room, player){
+  return !room.activeTeam || !player.team || player.team === room.activeTeam;
+}
+
+// ══════════════════════════════════════════════════════
 // 主連線處理
 // ══════════════════════════════════════════════════════
 wss.on('connection', function (ws) {
@@ -142,28 +206,50 @@ wss.on('connection', function (ws) {
       return;
     }
 
-    // ── JOIN：加入房間 ────────────────────────────────
+    // ── JOIN：加入房間（支援 rejoinToken 斷線重連，保留原本的 PID）──
     if (type === 'JOIN') {
       if (!roomID) { ws.send(JSON.stringify({ type: 'ERROR', payload: { msg: '缺少 roomID' } })); return; }
 
       const room = getOrCreateRoom(roomID);
+      if(!room.playersByToken) room.playersByToken = new Map();
 
-      if (room.players.size >= MAX_ROOM) {
-        ws.send(JSON.stringify({ type: 'ERROR', payload: { msg: '房間已滿（30人）' } }));
-        ws.close();
-        return;
+      const rejoinToken = payload?.rejoinToken || null;
+      let assignedPID;
+      let isReconnect = false;
+
+      if(rejoinToken && room.playersByToken.has(rejoinToken)){
+        // ── 重連：沿用先前的玩家身份（PID/隊伍/名稱），單位所有權才能接得回去 ──
+        currentPlayer = room.playersByToken.get(rejoinToken);
+        assignedPID   = currentPlayer.playerID;
+        isReconnect   = true;
+
+        // 若還有殘留的舊連線掛著同一個玩家身份（例如分頁沒關乾淨），強制斷開避免雙重連線
+        for(const [oldWs, p] of room.players){
+          if(p === currentPlayer && oldWs !== ws){
+            try{ oldWs.close(); }catch(e){}
+            room.players.delete(oldWs);
+          }
+        }
+        if(payload?.team) currentPlayer.team = payload.team;
+      } else {
+        if (room.players.size >= MAX_ROOM) {
+          ws.send(JSON.stringify({ type: 'ERROR', payload: { msg: '房間已滿（30人）' } }));
+          ws.close();
+          return;
+        }
+        // 伺服器分配唯一 playerID（房間內從 1 開始遞增）
+        if(!room.nextPID) room.nextPID = 1;
+        assignedPID   = room.nextPID++;
+        currentPlayer = { playerID: assignedPID, team: payload?.team, name: payload?.name || `玩家${assignedPID}` };
+        if(rejoinToken) room.playersByToken.set(rejoinToken, currentPlayer);
       }
 
-       // 伺服器分配唯一 playerID（房間內從 1 開始遞增）
-      if(!room.nextPID) room.nextPID = 1;
-      const assignedPID = room.nextPID++;
-
-      currentRoom   = room;
-      currentPlayer = { playerID: assignedPID, team: payload?.team, name: payload?.name || `玩家${assignedPID}` };
+      currentRoom = room;
       room.players.set(ws, currentPlayer);
 
-      console.log(`[Join] ${currentPlayer.name} 加入房間 ${roomID}，目前 ${room.players.size} 人`);
-      logReplayEvent(room, 'PLAYER_JOINED', { playerID: assignedPID, name: currentPlayer.name, team: currentPlayer.team }, assignedPID);
+      console.log(`[Join] ${currentPlayer.name} ${isReconnect ? '重新連線' : '加入'}房間 ${roomID}，目前 ${room.players.size} 人`);
+      logReplayEvent(room, isReconnect ? 'PLAYER_RECONNECTED' : 'PLAYER_JOINED',
+        { playerID: assignedPID, name: currentPlayer.name, team: currentPlayer.team }, assignedPID);
 
       // 回應加入成功（含房間內現有玩家清單）
       const existingPlayers = [];
@@ -178,11 +264,29 @@ wss.on('connection', function (ws) {
           playerID:        assignedPID,
           existingPlayers: existingPlayers,
           mapConfig:       room.mapConfig || null,
-          msg:             `歡迎加入房間 ${roomID}，目前 ${room.players.size} 人`
+          reconnected:     isReconnect,
+          msg:             isReconnect
+                              ? `歡迎回來，房間 ${roomID}，目前 ${room.players.size} 人`
+                              : `歡迎加入房間 ${roomID}，目前 ${room.players.size} 人`
         }
       }));
 
-      // 通知同房其他人
+      // 重連成功：把這名玩家自己單位的後勤快取（食物/彈藥/油料/人力）回填給他本人，
+      // 只送符合他 PID 前綴（例如 "3_"）的單位，不會外流其他玩家的後勤數據
+      if(isReconnect && room.unitLogistics){
+        const myPrefix = `${assignedPID}_`;
+        const myUnits = Object.values(room.unitLogistics).filter(u => String(u.uid).startsWith(myPrefix));
+        if(myUnits.length){
+          ws.send(JSON.stringify({
+            type: 'LOGISTICS_RESYNC',
+            roomID,
+            payload: { units: myUnits }
+          }));
+          console.log(`[Reconnect] 回填 ${myUnits.length} 筆後勤快取給玩家${assignedPID}`);
+        }
+      }
+
+      // 通知同房其他人（沿用既有的 PLAYER_JOINED 類型，client 端本來就是用 playerID 覆蓋、不會重複）
       broadcast(room, {
         type: 'PLAYER_JOINED',
         roomID,
@@ -254,7 +358,14 @@ wss.on('connection', function (ws) {
           currentRoom.mapConfig = { seed: packet.payload.seed, mapType: packet.payload.mapType };
         }
         currentRoom.gameStarted = true;
-        console.log(`[Start] 房主啟動遊戲，房間 ${roomID}，種子=${currentRoom.mapConfig?.seed}`);
+
+        // ── IGO-UGO：紅軍永遠先手，第 1 回合開始就啟動限時計時器 ──
+        currentRoom.activeTeam   = 'RED';
+        currentRoom.turnCount    = 1;
+        currentRoom.endedPlayers = new Set();
+        startTurnTimer(currentRoom, roomID);
+
+        console.log(`[Start] 房主啟動遊戲，房間 ${roomID}，種子=${currentRoom.mapConfig?.seed}，紅軍先手`);
         {
           const gameStartPayload = {
             seed:    currentRoom.mapConfig?.seed,
@@ -263,7 +374,11 @@ wss.on('connection', function (ws) {
               playerID: p.playerID,
               team:     p.team,
               loadout:  p.loadout,
-            }))
+            })),
+            activeTeam:   currentRoom.activeTeam,
+            turnCount:    currentRoom.turnCount,
+            deadline:     currentRoom.turnDeadline,
+            limitSeconds: TURN_TIME_LIMIT_SECONDS,
           };
           logReplayEvent(currentRoom, 'GAME_START', gameStartPayload, currentPlayer.playerID);
           broadcastAll(currentRoom, { type: 'GAME_START', roomID, payload: gameStartPayload });
@@ -305,6 +420,11 @@ wss.on('connection', function (ws) {
         break;
 
       case 'UNIT_MOVE':
+        // ── IGO-UGO：不是你的陣營在動，直接丟棄，避免跟正在行動的陣營打架 ──
+        if(!isActiveTeamPlayer(currentRoom, currentPlayer)){
+          console.warn(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）非行動陣營（${currentRoom.activeTeam}），忽略 UNIT_MOVE`);
+          break;
+        }
         // 更新房間單位位置快取
         if(currentRoom.units && packet.payload?.uid){
           const u = currentRoom.units[packet.payload.uid];
@@ -347,6 +467,10 @@ wss.on('connection', function (ws) {
         break;
 
       case 'ATTACK_RESULT':
+        if(!isActiveTeamPlayer(currentRoom, currentPlayer)){
+          console.warn(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）非行動陣營（${currentRoom.activeTeam}），忽略 ATTACK_RESULT`);
+          break;
+        }
         logReplayEvent(currentRoom, 'ATTACK_RESULT', packet.payload, currentPlayer.playerID);
         broadcast(currentRoom, packet, ws);
         break;
@@ -357,26 +481,77 @@ wss.on('connection', function (ws) {
         break;
 
       case 'DEPOT_SYNC':
+        if(!isActiveTeamPlayer(currentRoom, currentPlayer)){
+          console.warn(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）非行動陣營（${currentRoom.activeTeam}），忽略 DEPOT_SYNC`);
+          break;
+        }
+        // 快取進房間狀態，供晚加入/重連玩家用 REQUEST_DEPOTS 補課
+        if(packet.payload?.q != null && packet.payload?.r != null){
+          if(!currentRoom.depots) currentRoom.depots = {};
+          currentRoom.depots[`${packet.payload.q},${packet.payload.r}`] = packet.payload;
+        }
         logReplayEvent(currentRoom, 'DEPOT_SYNC', packet.payload, currentPlayer.playerID);
         broadcast(currentRoom, packet, ws);
         break;
 
       case 'DEPOT_REMOVE':
+        if(!isActiveTeamPlayer(currentRoom, currentPlayer)){
+          console.warn(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）非行動陣營（${currentRoom.activeTeam}），忽略 DEPOT_REMOVE`);
+          break;
+        }
+        if(currentRoom.depots && packet.payload?.q != null && packet.payload?.r != null){
+          delete currentRoom.depots[`${packet.payload.q},${packet.payload.r}`];
+        }
         logReplayEvent(currentRoom, 'DEPOT_REMOVE', packet.payload, currentPlayer.playerID);
         broadcast(currentRoom, packet, ws);
+        break;
+
+      case 'REQUEST_DEPOTS':
+        // 晚加入/重新連線的玩家要求取得目前所有補給點狀態（補課）
+        if(currentRoom.depots){
+          for(const key of Object.keys(currentRoom.depots)){
+            ws.send(JSON.stringify({
+              type: 'DEPOT_SYNC',
+              roomID,
+              payload: currentRoom.depots[key]
+            }));
+          }
+          console.log(`[Depot] 推送 ${Object.keys(currentRoom.depots).length} 個補給點給玩家${currentPlayer.playerID}`);
+        }
         break;
 
       case 'LOGISTICS_SNAPSHOT':
         // 賽後分析用後勤真相快照：只寫進回放紀錄，「絕對不」broadcast 給任何人，
         // 確保正式對戰當下敵方依然看不到彼此的彈藥/油料/人力（安全機制不變）
         logReplayEvent(currentRoom, 'LOGISTICS_SNAPSHOT', packet.payload, currentPlayer.playerID);
+
+        // 同時快取每個單位「最新一次」的後勤數據，供本人斷線重連時要回來
+        // （只給本人，見下方 JOIN 重連流程的過濾邏輯，不會外流給其他玩家）
+        if(!currentRoom.unitLogistics) currentRoom.unitLogistics = {};
+        if(Array.isArray(packet.payload?.units)){
+          for(const u of packet.payload.units){
+            if(u && u.uid) currentRoom.unitLogistics[u.uid] = u;
+          }
+        }
         break;
 
       case 'END_TURN':
+        // ── IGO-UGO：不是你的陣營在動，這顆 END_TURN 不算數 ──
+        if(!isActiveTeamPlayer(currentRoom, currentPlayer)){
+          console.warn(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）非行動陣營（${currentRoom.activeTeam}），忽略 END_TURN`);
+          break;
+        }
+
         if(!currentRoom.endedPlayers) currentRoom.endedPlayers = new Set();
         currentRoom.endedPlayers.add(currentPlayer.playerID);
-        console.log(`[Turn] 玩家${currentPlayer.playerID} 結束回合 ${currentRoom.endedPlayers.size}/${currentRoom.players.size}`);
-        logReplayEvent(currentRoom, 'END_TURN', { playerID: currentPlayer.playerID }, currentPlayer.playerID);
+
+        // 只算「目前行動陣營」的人數，不是全房間人數
+        const activeTeamCount = currentRoom.activeTeam
+          ? Array.from(currentRoom.players.values()).filter(p => p.team === currentRoom.activeTeam).length
+          : currentRoom.players.size;
+
+        console.log(`[Turn] 玩家${currentPlayer.playerID}（${currentPlayer.team}）結束回合 ${currentRoom.endedPlayers.size}/${activeTeamCount}`);
+        logReplayEvent(currentRoom, 'END_TURN', { playerID: currentPlayer.playerID, team: currentPlayer.team }, currentPlayer.playerID);
 
         // 通知所有人目前進度
         broadcastAll(currentRoom, {
@@ -385,21 +560,14 @@ wss.on('connection', function (ws) {
           payload: {
             playerID:   currentPlayer.playerID,
             endedCount: currentRoom.endedPlayers.size,
-            totalCount: currentRoom.players.size,
+            totalCount: activeTeamCount,
+            activeTeam: currentRoom.activeTeam,
           }
         });
 
-        // 全員結束 → 推進回合
-        if(currentRoom.endedPlayers.size >= currentRoom.players.size){
-          currentRoom.endedPlayers.clear();
-          currentRoom.turnCount = (currentRoom.turnCount || 1) + 1;
-          console.log(`[Turn] 推進到第 ${currentRoom.turnCount} 回合`);
-          logReplayEvent(currentRoom, 'TURN_ADVANCE', { turnCount: currentRoom.turnCount }, null);
-          broadcastAll(currentRoom, {
-            type: 'TURN_ADVANCE',
-            roomID,
-            payload: { turnCount: currentRoom.turnCount }
-          });
+        // 該陣營全員結束 → 換對方陣營行動（藍軍動完才是完整一回合，見 advanceToNextTeam）
+        if(currentRoom.endedPlayers.size >= activeTeamCount){
+          advanceToNextTeam(currentRoom, roomID, false);
         }
         break;
 
@@ -422,6 +590,7 @@ wss.on('connection', function (ws) {
 
       // 房間空了就清除，並關閉該房間的回放紀錄檔
       if (currentRoom.players.size === 0) {
+        clearTurnTimer(currentRoom);
         _closeReplayLog(currentRoom);
         for (const [id, r] of rooms) {
           if (r === currentRoom) { rooms.delete(id); console.log(`[Room] 房間已清除`); break; }
@@ -440,4 +609,4 @@ wss.on('connection', function (ws) {
 function getRoomID(targetRoom) {
   for (const [id, r] of rooms) { if (r === targetRoom) return id; }
   return null;
-            }
+        }
